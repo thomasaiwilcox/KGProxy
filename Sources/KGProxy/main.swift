@@ -162,7 +162,7 @@ final class PassthroughDelegate: HTTPClientResponseDelegate {
     }
 
     func didReceiveHead(task: HTTPClient.Task<Void>, _ head: HTTPResponseHead) -> EventLoopFuture<Void> {
-        // Propagate important headers to client (content-type, transfer-encoding)
+        // Propagate important headers to client (content-type, transfer-encoding, cache-control, x-request-id)
         setHeaders(head.headers)
         return eventLoop.makeSucceededVoidFuture()
     }
@@ -186,7 +186,63 @@ final class PassthroughDelegate: HTTPClientResponseDelegate {
 // MARK: - Routes
 
 func bootRoutes(_ app: Application) throws {
-    app.get("health") { _ in "ok" }
+    // Add CORS middleware for browser clients
+    let corsConfiguration = CORSMiddleware.Configuration(
+        allowedOrigin: .all,
+        allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
+        allowedHeaders: [
+            .accept,
+            .authorization,
+            .contentType,
+            .origin,
+            .xRequestedWith,
+            .userAgent,
+            .accessControlAllowOrigin,
+            .name("X-KG-Consent"),
+            .name("X-KG-User-ID"),
+            .name("X-KG-Namespace"),
+            .name("X-KG-Mode"),
+            .name("X-KG-Context-Limit")
+        ]
+    )
+    let cors = CORSMiddleware(configuration: corsConfiguration)
+    app.middleware.use(cors)
+
+    // Enhanced health endpoints with JSON responses
+    app.get("health") { req async throws -> [String: Any] in
+        let upstream = extractOpenAIConfig()
+        let driverChoice = DriverChoice(rawValue: (Environment.get("KG_DRIVER") ?? "kuzu").lowercased()) ?? .kuzu
+        return [
+            "status": "ok",
+            "driver": driverChoice.rawValue,
+            "upstream_base_url": upstream.baseURL,
+            "timestamp": ISO8601DateFormatter().string(from: Date())
+        ]
+    }
+    
+    app.on(.HEAD, "health") { req async throws -> Response in
+        let response = Response(status: .ok)
+        response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        return response
+    }
+    
+    app.get("ready") { req async throws -> [String: Any] in
+        let upstream = extractOpenAIConfig()
+        let driverChoice = DriverChoice(rawValue: (Environment.get("KG_DRIVER") ?? "kuzu").lowercased()) ?? .kuzu
+        
+        // Test KG engine initialization
+        do {
+            let _ = try makeEngine(for: "readiness-check")
+            return [
+                "status": "ready",
+                "driver": driverChoice.rawValue,
+                "upstream_base_url": upstream.baseURL,
+                "timestamp": ISO8601DateFormatter().string(from: Date())
+            ]
+        } catch {
+            throw Abort(.serviceUnavailable, reason: "KG engine initialization failed: \(error.localizedDescription)")
+        }
+    }
 
     // OpenAI-compatible chat completions (supports streaming and non-streaming)
     app.post("v1", "chat", "completions") { req async throws -> Response in
@@ -253,9 +309,18 @@ func bootRoutes(_ app: Application) throws {
                    let content = message["content"] as? String {
                     assistantText = content
                 }
-                // Return passthrough
-                var resp = Response(status: .ok)
+                // Return passthrough with upstream status and headers
+                var resp = Response(status: HTTPResponseStatus(statusCode: Int(result.status.code)))
                 resp.headers.replaceOrAdd(name: .contentType, value: "application/json")
+                
+                // Propagate selected headers from upstream
+                if let cc = result.headers.first(name: "cache-control") {
+                    resp.headers.replaceOrAdd(name: "cache-control", value: cc)
+                }
+                if let rid = result.headers.first(name: "x-request-id") {
+                    resp.headers.replaceOrAdd(name: "x-request-id", value: rid)
+                }
+                
                 resp.body = .init(data: data)
                 // Ingest asynchronously
                 ingestEpisodes(engine: engine, kg: kg, request: body.messages, assistant: assistantText)
@@ -296,9 +361,18 @@ func bootRoutes(_ app: Application) throws {
                 accumulator: accumulator,
                 eventLoop: req.eventLoop
             ) { headHeaders in
-                // If upstream provides content-type, propagate it (usually text/event-stream)
+                // Propagate important headers from upstream
                 if let ct = headHeaders.first(name: "content-type") {
                     response.headers.replaceOrAdd(name: .contentType, value: ct)
+                }
+                if let cc = headHeaders.first(name: "cache-control") {
+                    response.headers.replaceOrAdd(name: "cache-control", value: cc)
+                }
+                if let te = headHeaders.first(name: "transfer-encoding") {
+                    response.headers.replaceOrAdd(name: "transfer-encoding", value: te)
+                }
+                if let rid = headHeaders.first(name: "x-request-id") {
+                    response.headers.replaceOrAdd(name: "x-request-id", value: rid)
                 }
             }
 
