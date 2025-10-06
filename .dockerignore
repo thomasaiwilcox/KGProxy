@@ -1,0 +1,13 @@
+# Swift / SPM build and metadata
+.build
+.swiftpm
+Package.resolved
+
+# VCS and local
+.git
+.gitignore
+.DS_Store
+
+# App data and env
+.env
+data/
